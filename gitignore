@@ -1,0 +1,21 @@
+# Nunca subir esto a GitHub
+~/.config/osint-ai/
+.env
+*.env
+config.json
+.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Reportes generados
+reporte*.json
+reporte*.txt
+output/
