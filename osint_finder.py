@@ -6,6 +6,7 @@ CLI de reconocimiento OSINT con análisis por IA (Claude, GPT-4, Grok, Gemini).
 
 import argparse
 import asyncio
+import gc
 import html
 import json
 import re
@@ -107,13 +108,17 @@ class PaidAPIHooks:
 
 # ── Búsquedas ─────────────────────────────────────────────────────────────────
 
+_REQUEST_SEMAPHORE = asyncio.Semaphore(5)
+
+
 async def check_username(username: str, client: httpx.AsyncClient) -> list[dict]:
     results = []
 
     async def check_one(name: str, url_tpl: str):
         url = url_tpl.format(username)
         try:
-            r = await client.get(url, timeout=8.0, follow_redirects=True)
+            async with _REQUEST_SEMAPHORE:
+                r = await client.get(url, timeout=8.0, follow_redirects=True)
             found = r.status_code == 200
             fp_status = "FOUND"
 
@@ -167,6 +172,7 @@ async def check_username(username: str, client: httpx.AsyncClient) -> list[dict]
             })
 
     await asyncio.gather(*[check_one(n, u) for n, u in SHERLOCK_PLATFORMS])
+    gc.collect()
     return sorted(results, key=lambda x: x["found"], reverse=True)
 
 
@@ -177,6 +183,7 @@ def generate_username_variants(username: str) -> list[str]:
 async def check_username_variants(username: str, client: httpx.AsyncClient) -> dict[str, list[dict]]:
     variants = generate_username_variants(username)
     results = await asyncio.gather(*[check_username(v, client) for v in variants])
+    gc.collect()
     return dict(zip(variants, results))
 
 
@@ -741,7 +748,11 @@ async def run(args):
 
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 
-    async with httpx.AsyncClient(headers=headers) as client:
+    async with httpx.AsyncClient(
+        headers=headers,
+        limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        timeout=httpx.Timeout(10.0, connect=5.0),
+    ) as client:
         with Progress(SpinnerColumn(style="red"), TextColumn("[bold red]{task.description}"),
                       console=console) as prog:
 
@@ -796,6 +807,7 @@ async def run(args):
             if not args.no_ai:
                 t = prog.add_task(f"Analizando con {provider['name']}...", total=None)
                 analysis = await analyze_with_ai(findings, provider, api_key, client)
+                gc.collect()
                 prog.remove_task(t)
                 print_ai_analysis(analysis, provider["name"])
             else:
