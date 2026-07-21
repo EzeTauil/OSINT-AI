@@ -18,7 +18,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 from rich.text import Text
 
-from config_manager import setup_interactive, PROVIDERS
+from config_manager import setup_interactive
 
 console = Console()
 
@@ -156,6 +156,16 @@ async def check_username(username: str, client: httpx.AsyncClient) -> list[dict]
 
     await asyncio.gather(*[check_one(n, u) for n, u in SHERLOCK_PLATFORMS])
     return sorted(results, key=lambda x: x["found"], reverse=True)
+
+
+def generate_username_variants(username: str) -> list[str]:
+    return [f"{username}_", f"_{username}", f"{username}01", f"{username}1337"]
+
+
+async def check_username_variants(username: str, client: httpx.AsyncClient) -> dict[str, list[dict]]:
+    variants = generate_username_variants(username)
+    results = await asyncio.gather(*[check_username(v, client) for v in variants])
+    return dict(zip(variants, results))
 
 
 async def check_github_profile(username: str, client: httpx.AsyncClient) -> dict:
@@ -306,7 +316,8 @@ async def check_email_breaches(email: str, client: httpx.AsyncClient) -> dict:
 # ── Análisis IA — multi-proveedor ─────────────────────────────────────────────
 
 async def analyze_with_ai(findings: dict, provider: dict, api_key: str, client: httpx.AsyncClient) -> str:
-    prompt = f"""Eres un analista OSINT experto en red team. Analiza los siguientes hallazgos y generá un perfil completo.
+    prompt = f"""Eres un analista OSINT experto en red team. Analiza los siguientes hallazgos
+y generá un perfil completo.
 
 HALLAZGOS:
 {json.dumps(findings, indent=2, ensure_ascii=False)}
@@ -376,6 +387,17 @@ Basate solo en los datos. Respondé en español argentino, técnico y directo.""
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
+def _username_row_style(r: dict) -> tuple[str, str]:
+    if r["found"]:
+        fp = r.get("fp_status", "FOUND")
+        if fp == "POSIBLE FP":
+            return "[yellow]⚠ POSIBLE FP[/yellow]", "[yellow]—[/yellow]"
+        conf_val = r.get("confidence", "Medio")
+        color = {"Alto": "green", "Medio": "yellow", "Bajo": "red"}.get(conf_val, "white")
+        return "[bold green]✓ FOUND[/bold green]", f"[{color}]{conf_val}[/{color}]"
+    return "[dim]✗ not found[/dim]", "[dim]—[/dim]"
+
+
 def print_username_results(results: list[dict]):
     table = Table(title="🔍 Username Lookup", border_style="red", show_lines=True)
     table.add_column("Plataforma", style="bold cyan", width=15)
@@ -383,21 +405,30 @@ def print_username_results(results: list[dict]):
     table.add_column("Confianza", width=10)
     table.add_column("URL", style="dim")
     for r in results:
-        if r["found"]:
-            fp = r.get("fp_status", "FOUND")
-            if fp == "POSIBLE FP":
-                status = "[yellow]⚠ POSIBLE FP[/yellow]"
-                conf_str = "[yellow]—[/yellow]"
-            else:
-                status = "[bold green]✓ FOUND[/bold green]"
-                conf_val = r.get("confidence", "Medio")
-                color = {"Alto": "green", "Medio": "yellow", "Bajo": "red"}.get(conf_val, "white")
-                conf_str = f"[{color}]{conf_val}[/{color}]"
-        else:
-            status = "[dim]✗ not found[/dim]"
-            conf_str = "[dim]—[/dim]"
+        status, conf_str = _username_row_style(r)
         table.add_row(r["platform"], status, conf_str, r["url"] if r["found"] else "—")
     console.print(table)
+
+
+def print_username_variants(username: str, variant_results: dict[str, list[dict]]):
+    any_found = any(r["found"] for results in variant_results.values() for r in results)
+    console.print(f"\n[bold red]🔗 Variantes de @{username}[/bold red]")
+    for variant, results in variant_results.items():
+        hits = [r for r in results if r["found"]]
+        if not hits:
+            console.print(f"  [dim]@{variant}: sin coincidencias[/dim]")
+            continue
+        table = Table(title=f"@{variant}", border_style="magenta", show_lines=True)
+        table.add_column("Plataforma", style="bold cyan", width=15)
+        table.add_column("Estado", width=16)
+        table.add_column("Confianza", width=10)
+        table.add_column("URL", style="dim")
+        for r in hits:
+            status, conf_str = _username_row_style(r)
+            table.add_row(r["platform"], status, conf_str, r["url"])
+        console.print(table)
+    if not any_found:
+        console.print("  [dim]Ninguna variante encontrada.[/dim]")
 
 
 def print_email_breaches(result: dict, email: str):
@@ -495,7 +526,7 @@ async def run(args):
     findings = {
         "target": {"name": args.name, "username": args.username,
                    "email": args.email, "phone": args.phone},
-        "username_lookup": [], "github": {}, "github_repos": [],
+        "username_lookup": [], "username_variants": {}, "github": {}, "github_repos": [],
         "hackernews": {}, "npm": {}, "google_dorks": [],
         "email_breaches": {},
     }
@@ -511,6 +542,13 @@ async def run(args):
                 findings["username_lookup"] = await check_username(args.username, client)
                 prog.remove_task(t)
                 print_username_results(findings["username_lookup"])
+
+                if any(r["found"] and r.get("fp_status") != "POSIBLE FP"
+                       for r in findings["username_lookup"]):
+                    t = prog.add_task(f"Correlacionando variantes de @{args.username}...", total=None)
+                    findings["username_variants"] = await check_username_variants(args.username, client)
+                    prog.remove_task(t)
+                    print_username_variants(args.username, findings["username_variants"])
 
                 t = prog.add_task("Analizando GitHub...", total=None)
                 findings["github"]       = await check_github_profile(args.username, client)

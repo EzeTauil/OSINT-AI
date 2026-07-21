@@ -4,14 +4,12 @@ Guarda las credenciales encriptadas en ~/.config/osint-ai/config.json
 """
 
 import json
-import os
-import base64
 from pathlib import Path
+
 from cryptography.fernet import Fernet
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
-from rich import print as rprint
+from rich.prompt import Confirm, Prompt
 
 console = Console()
 
