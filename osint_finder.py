@@ -6,9 +6,11 @@ CLI de reconocimiento OSINT con análisis por IA (Claude, GPT-4, Grok, Gemini).
 
 import argparse
 import asyncio
+import html
 import json
+import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -140,6 +142,16 @@ async def check_username(username: str, client: httpx.AsyncClient) -> list[dict]
                             fp_status = "POSIBLE FP"
                     except Exception:
                         pass
+                elif name == "Steam":
+                    # Steam devuelve 200 con este texto exacto cuando el perfil no existe
+                    if "The specified profile could not be found" in r.text:
+                        fp_status = "POSIBLE FP"
+                elif name == "Twitch":
+                    # Canales inexistentes devuelven <title>Twitch</title> genérico (sin nombre
+                    # de canal); no usar el meta og:title porque Twitch lo emite con comillas
+                    # simples (<meta property='og:title' content='Twitch'>).
+                    if "<title>Twitch</title>" in r.text:
+                        fp_status = "POSIBLE FP"
 
             confidence = PLATFORM_CONFIDENCE.get(name, "Medio") if found else None
             results.append({
@@ -211,7 +223,8 @@ async def check_hackernews(username: str, client: httpx.AsyncClient) -> dict:
                 return {"found": True, "total_posts": d.get("nbHits", 0),
                         "recent_posts": [{"title": h.get("title") or h.get("comment_text","")[:100],
                                           "url": h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}",
-                                          "points": h.get("points", 0)} for h in hits[:3]]}
+                                          "points": h.get("points", 0),
+                                          "created_at": h.get("created_at")} for h in hits[:3]]}
     except Exception:
         pass
     return {"found": False}
@@ -227,10 +240,67 @@ async def check_npm_profile(username: str, client: httpx.AsyncClient) -> dict:
                 return {"found": True, "total": d.get("total", 0),
                         "packages": [{"name": o["package"]["name"],
                                       "description": o["package"].get("description",""),
-                                      "version": o["package"].get("version","")} for o in objs[:5]]}
+                                      "version": o["package"].get("version",""),
+                                      "date": o["package"].get("date")} for o in objs[:5]]}
     except Exception:
         pass
     return {"found": False}
+
+
+async def check_reddit_account(username: str, client: httpx.AsyncClient) -> dict:
+    try:
+        r = await client.get(f"https://www.reddit.com/user/{username}/about.json", timeout=8.0)
+        if r.status_code == 200:
+            d = r.json().get("data", {})
+            created = d.get("created_utc")
+            if d and created:
+                return {
+                    "found": True,
+                    "created_utc": created,
+                    "created_iso": datetime.fromtimestamp(created, tz=timezone.utc).isoformat(),
+                    "url": f"https://www.reddit.com/user/{username}",
+                }
+    except Exception:
+        pass
+    return {"found": False}
+
+
+def build_activity_timeline(findings: dict, reddit_account: dict) -> list[dict]:
+    entries = []
+
+    gh = findings.get("github", {})
+    if gh.get("found") and gh.get("created_at"):
+        entries.append({"platform": "GitHub", "date": gh["created_at"],
+                         "label": "Cuenta creada", "url": gh.get("url", "")})
+
+    if reddit_account.get("found") and reddit_account.get("created_iso"):
+        entries.append({"platform": "Reddit", "date": reddit_account["created_iso"],
+                         "label": "Cuenta creada", "url": reddit_account.get("url", "")})
+
+    username = findings.get("target", {}).get("username") or ""
+
+    npm_dates = [p["date"] for p in findings.get("npm", {}).get("packages", []) if p.get("date")]
+    if npm_dates:
+        entries.append({"platform": "npm", "date": max(npm_dates),
+                         "label": "Último paquete publicado",
+                         "url": f"https://www.npmjs.com/~{username}"})
+
+    hn_dates = [p["created_at"] for p in findings.get("hackernews", {}).get("recent_posts", [])
+                if p.get("created_at")]
+    if hn_dates:
+        entries.append({"platform": "HackerNews", "date": min(hn_dates),
+                         "label": "Primer post indexado (no es fecha de creación de cuenta)",
+                         "url": f"https://news.ycombinator.com/user?id={username}"})
+
+    def _parse(e):
+        try:
+            return datetime.fromisoformat(e["date"].replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    parsed = [(e, _parse(e)) for e in entries]
+    valid = [(e, d) for e, d in parsed if d is not None]
+    return [e for e, _ in sorted(valid, key=lambda pair: pair[1])]
 
 
 async def generate_google_dorks(name, username, email) -> list[str]:
@@ -483,6 +553,18 @@ def print_github_info(profile: dict, repos: list):
         console.print(tbl)
 
 
+def print_activity_timeline(timeline: list[dict]):
+    if not timeline:
+        return
+    tbl = Table(title="🕒 Línea de Tiempo de Actividad", border_style="red", show_lines=True)
+    tbl.add_column("Fecha", style="bold yellow", width=22)
+    tbl.add_column("Plataforma", style="bold cyan", width=12)
+    tbl.add_column("Evento", style="white")
+    for e in timeline:
+        tbl.add_row(e["date"], e["platform"], e["label"])
+    console.print(Panel(tbl, border_style="red"))
+
+
 def print_dorks(dorks: list[str]):
     console.print(Panel("\n".join(f"[cyan]•[/cyan] {d}" for d in dorks),
                         title="[bold yellow]🔎 Google Dorks[/bold yellow]", border_style="yellow"))
@@ -507,6 +589,132 @@ def save_results(findings: dict, analysis: str, path: str):
     console.print(f"\n[green]✓ Guardado en:[/green] [bold]{path}[/bold]")
 
 
+def _md_lite_to_html(text: str) -> str:
+    if not text:
+        return "<p><em>Análisis IA no ejecutado (--no-ai).</em></p>"
+    escaped = html.escape(text)
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    paragraphs = escaped.split("\n\n")
+    return "".join(f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs if p.strip())
+
+
+_REPORT_CSS = """
+  body { background:#0d0d0d; color:#e6e6e6; font-family:ui-monospace,"Segoe UI",sans-serif;
+         margin:0; padding:2rem; line-height:1.5; }
+  h1 { color:#ff4d4d; border-bottom:2px solid #ff4d4d; padding-bottom:.5rem; }
+  h2 { color:#ff4d4d; margin-top:2.5rem; }
+  .card { background:#1a1a1a; border:1px solid #333; border-radius:8px; padding:1.25rem; margin:1rem 0; }
+  .meta span { display:inline-block; margin-right:1.5rem; color:#ccc; }
+  .meta b { color:#fff; }
+  table { border-collapse:collapse; width:100%; margin-top:.75rem; }
+  th, td { text-align:left; padding:.5rem .75rem; border-bottom:1px solid #333; }
+  th { color:#ff4d4d; text-transform:uppercase; font-size:.8rem; }
+  tr:hover { background:#151515; }
+  a { color:#7ab8ff; }
+  .badge { padding:.15rem .5rem; border-radius:4px; font-size:.8rem; font-weight:bold; }
+  .found { background:#173a1f; color:#4ade80; }
+  .fp { background:#3a3417; color:#eab308; }
+  .notfound { background:#222; color:#777; }
+  .conf-alto { color:#4ade80; }
+  .conf-medio { color:#eab308; }
+  .conf-bajo { color:#ef4444; }
+  ul.dorks { list-style:none; padding:0; }
+  ul.dorks li { padding:.35rem 0; border-bottom:1px solid #222; color:#ccc; }
+  .analysis p { color:#ddd; }
+"""
+
+
+def _report_target_html(target: dict) -> str:
+    parts = []
+    for label, key in [("Nombre", "name"), ("Username", "username"),
+                        ("Email", "email"), ("Teléfono", "phone")]:
+        val = target.get(key)
+        if val:
+            parts.append(f"<span><b>{label}:</b> {html.escape(str(val))}</span>")
+    return "".join(parts)
+
+
+def _report_username_table_html(results: list[dict]) -> str:
+    if not results:
+        return "<p><em>Sin resultados.</em></p>"
+    rows = []
+    for r in results:
+        if r["found"]:
+            fp = r.get("fp_status", "FOUND")
+            if fp == "POSIBLE FP":
+                status = '<span class="badge fp">⚠ POSIBLE FP</span>'
+                conf = "—"
+            else:
+                status = '<span class="badge found">✓ FOUND</span>'
+                conf_val = r.get("confidence", "Medio")
+                conf = f'<span class="conf-{conf_val.lower()}">{html.escape(conf_val)}</span>'
+        else:
+            status = '<span class="badge notfound">✗ not found</span>'
+            conf = "—"
+        url = html.escape(r["url"]) if r["found"] else "—"
+        url_cell = f'<a href="{url}">{url}</a>' if r["found"] else "—"
+        rows.append(f"<tr><td>{html.escape(r['platform'])}</td><td>{status}</td>"
+                    f"<td>{conf}</td><td>{url_cell}</td></tr>")
+    return ("<table><tr><th>Plataforma</th><th>Estado</th><th>Confianza</th><th>URL</th></tr>"
+            + "".join(rows) + "</table>")
+
+
+def _report_variants_html(variant_results: dict[str, list[dict]]) -> str:
+    if not variant_results:
+        return ""
+    sections = []
+    for variant, results in variant_results.items():
+        hits = [r for r in results if r["found"]]
+        if not hits:
+            sections.append(f"<p><b>@{html.escape(variant)}:</b> sin coincidencias</p>")
+            continue
+        sections.append(f"<h3>@{html.escape(variant)}</h3>" + _report_username_table_html(hits))
+    return "<h2>🔗 Variantes de Username</h2><div class='card'>" + "".join(sections) + "</div>"
+
+
+def _report_dorks_html(dorks: list[str]) -> str:
+    if not dorks:
+        return ""
+    items = "".join(f"<li>{html.escape(d)}</li>" for d in dorks)
+    return f"<h2>🔎 Google Dorks</h2><div class='card'><ul class='dorks'>{items}</ul></div>"
+
+
+def generate_html_report(findings: dict, analysis: str) -> str:
+    target = findings.get("target", {})
+    title = html.escape(target.get("username") or target.get("name") or target.get("email") or "OSINT Report")
+    generated = datetime.now().isoformat(timespec="seconds")
+
+    variants_html = _report_variants_html(findings.get("username_variants", {}))
+    dorks_html = _report_dorks_html(findings.get("google_dorks", []))
+
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>OSINT Report — {title}</title>
+<style>{_REPORT_CSS}</style>
+</head>
+<body>
+  <h1>🔍 OSINT Person Finder — Reporte</h1>
+  <div class="card meta">
+    {_report_target_html(target)}
+    <span><b>Generado:</b> {html.escape(generated)}</span>
+  </div>
+
+  <h2>Username Lookup</h2>
+  <div class="card">{_report_username_table_html(findings.get("username_lookup", []))}</div>
+
+  {variants_html}
+
+  {dorks_html}
+
+  <h2>🧠 Análisis IA</h2>
+  <div class="card analysis">{_md_lite_to_html(analysis)}</div>
+</body>
+</html>
+"""
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def run(args):
@@ -528,7 +736,7 @@ async def run(args):
                    "email": args.email, "phone": args.phone},
         "username_lookup": [], "username_variants": {}, "github": {}, "github_repos": [],
         "hackernews": {}, "npm": {}, "google_dorks": [],
-        "email_breaches": {},
+        "email_breaches": {}, "reddit_account": {}, "activity_timeline": [],
     }
 
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
@@ -568,6 +776,12 @@ async def run(args):
                 if findings["npm"].get("found"):
                     console.print(f"[green]✓ npm:[/green] {findings['npm']['total']} paquetes")
 
+                t = prog.add_task(f"Correlacionando línea de tiempo para @{args.username}...", total=None)
+                findings["reddit_account"] = await check_reddit_account(args.username, client)
+                findings["activity_timeline"] = build_activity_timeline(findings, findings["reddit_account"])
+                prog.remove_task(t)
+                print_activity_timeline(findings["activity_timeline"])
+
             t = prog.add_task("Generando Google Dorks...", total=None)
             findings["google_dorks"] = await generate_google_dorks(args.name, args.username, args.email)
             prog.remove_task(t)
@@ -590,6 +804,16 @@ async def run(args):
         if args.save:
             save_results(findings, analysis, args.save)
 
+        if args.report:
+            reports_dir = Path(__file__).resolve().parent / "reports"
+            reports_dir.mkdir(exist_ok=True)
+            filename = Path(args.report).name
+            if not filename.lower().endswith(".html"):
+                filename += ".html"
+            report_path = reports_dir / filename
+            report_path.write_text(generate_html_report(findings, analysis), encoding="utf-8")
+            console.print(f"\n[green]✓ Reporte HTML guardado en:[/green] [bold]{report_path.resolve()}[/bold]")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -606,6 +830,9 @@ FLAGS:
                   sin necesidad de API key. Muestra brechas conocidas con datos expuestos.
   -p TELÉFONO   Incluye el teléfono en el contexto del análisis IA.
   --save FILE   Exporta todos los hallazgos en formato JSON o TXT.
+  --report NAME Genera un reporte HTML autocontenido (dark theme) con tabla de username lookup,
+                  variantes, Google Dorks y análisis IA. Se guarda en reports/NAME.html
+                  (se crea la carpeta si no existe; agrega .html si falta).
   --no-ai       Saltear análisis IA (útil para reconocimiento rápido sin API key).
 
 EJEMPLOS:
@@ -618,6 +845,9 @@ EJEMPLOS:
   # Reconocimiento rápido sin IA, guardar reporte JSON
   python osint_finder.py -u johndoe --save reporte.json --no-ai
 
+  # Generar reporte HTML autocontenido (se guarda en reports/scan_johndoe.html)
+  python osint_finder.py -u johndoe --report scan_johndoe.html
+
   # Investigar email: dorks + verificación en brechas conocidas
   python osint_finder.py -e victim@company.com --no-ai
 
@@ -629,6 +859,7 @@ EJEMPLOS:
     parser.add_argument("-e", "--email",    help="Email")
     parser.add_argument("-p", "--phone",    help="Teléfono")
     parser.add_argument("--save",           help="Guardar resultados (.json o .txt)", metavar="ARCHIVO")
+    parser.add_argument("--report",         help="Generar reporte HTML (guardado en reports/)", metavar="NOMBRE")
     parser.add_argument("--no-ai",          action="store_true", help="Saltar análisis IA")
     args = parser.parse_args()
 

@@ -20,3 +20,4 @@ build/
 reporte*.json
 reporte*.txt
 output/
+reports/
