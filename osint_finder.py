@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+import phonenumbers
+from phonenumbers import NumberParseException, PhoneNumberType, carrier, geocoder
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -187,6 +189,39 @@ async def check_username_variants(username: str, client: httpx.AsyncClient) -> d
     return dict(zip(variants, results))
 
 
+_PHONE_TYPE_LABELS = {
+    PhoneNumberType.MOBILE: "Móvil",
+    PhoneNumberType.FIXED_LINE: "Fijo",
+    PhoneNumberType.FIXED_LINE_OR_MOBILE: "Fijo o Móvil",
+    PhoneNumberType.VOIP: "VOIP",
+    PhoneNumberType.TOLL_FREE: "Gratuito",
+    PhoneNumberType.PREMIUM_RATE: "Tarifa Premium",
+    PhoneNumberType.SHARED_COST: "Costo Compartido",
+    PhoneNumberType.PERSONAL_NUMBER: "Número Personal",
+    PhoneNumberType.PAGER: "Pager",
+    PhoneNumberType.UAN: "UAN",
+    PhoneNumberType.VOICEMAIL: "Buzón de Voz",
+    PhoneNumberType.UNKNOWN: "Desconocido",
+}
+
+
+def analyze_phone_number(phone: str) -> dict:
+    try:
+        n = phonenumbers.parse(phone, None)
+    except NumberParseException as e:
+        return {"valid": False, "error": str(e)}
+
+    valid = phonenumbers.is_valid_number(n)
+    return {
+        "valid": valid,
+        "e164": phonenumbers.format_number(n, phonenumbers.PhoneNumberFormat.E164),
+        "region": phonenumbers.region_code_for_number(n),
+        "location": geocoder.description_for_number(n, "es") or None,
+        "carrier": carrier.name_for_number(n, "es") or None,
+        "number_type": _PHONE_TYPE_LABELS.get(phonenumbers.number_type(n), "Desconocido") if valid else None,
+    }
+
+
 async def check_github_profile(username: str, client: httpx.AsyncClient) -> dict:
     try:
         r = await client.get(f"https://api.github.com/users/{username}", timeout=10.0,
@@ -310,7 +345,7 @@ def build_activity_timeline(findings: dict, reddit_account: dict) -> list[dict]:
     return [e for e, _ in sorted(valid, key=lambda pair: pair[1])]
 
 
-async def generate_google_dorks(name, username, email) -> list[str]:
+async def generate_google_dorks(name, username, email, phone) -> list[str]:
     dorks = []
     if name:
         parts = name.strip().split()
@@ -344,6 +379,15 @@ async def generate_google_dorks(name, username, email) -> list[str]:
             f'"{email}" password OR breach OR leak',
             f'"{email}" site:{domain}' if domain else "",
             f'intext:"{email}" filetype:sql OR filetype:csv OR filetype:txt',
+        ]
+    if phone:
+        dorks += [
+            f'"{phone}" site:linkedin.com',
+            f'"{phone}" site:facebook.com',
+            f'"{phone}" filetype:pdf',
+            f'"{phone}" "whatsapp"',
+            f'"{phone}" breach OR leak OR pwned',
+            f'"{phone}" site:pastebin.com OR site:t.me',
         ]
     return [d for d in dorks if d]
 
@@ -407,6 +451,10 @@ Generá un análisis con:
 5. **VECTORES DE ATAQUE** — para red team: spear phishing, pretextos, info sensible expuesta
 6. **LAGUNAS** — qué no encontramos y cómo buscarlo
 7. **PRÓXIMOS PASOS OSINT** — recomendaciones concretas
+
+Si sólo tenés el teléfono sin username, nombre o email, no generes un perfil de ataque
+basado únicamente en ese dato — usalo solo como contexto de apoyo cuando se combine con
+otras señales.
 
 Basate solo en los datos. Respondé en español argentino, técnico y directo."""
 
@@ -558,6 +606,20 @@ def print_github_info(profile: dict, repos: list):
         for r in repos[:8]:
             tbl.add_row(r["name"], r.get("language") or "—", str(r.get("stars",0)), (r.get("description") or "")[:60])
         console.print(tbl)
+
+
+def print_phone_info(info: dict, phone: str):
+    if not info.get("valid"):
+        console.print(f"\n[yellow]⚠ Teléfono:[/yellow] [dim]{phone} — formato inválido o no reconocido[/dim]")
+        return
+    t = Text()
+    for label, key in [("Número (E.164)", "e164"), ("País", "region"), ("Ubicación", "location"),
+                       ("Operador", "carrier"), ("Tipo", "number_type")]:
+        val = info.get(key)
+        if val:
+            t.append(f"  {label}: ", style="bold yellow")
+            t.append(f"{val}\n", style="white")
+    console.print(Panel(t, title="[bold red]📱 Teléfono[/bold red]", border_style="red"))
 
 
 def print_activity_timeline(timeline: list[dict]):
@@ -743,7 +805,7 @@ async def run(args):
                    "email": args.email, "phone": args.phone},
         "username_lookup": [], "username_variants": {}, "github": {}, "github_repos": [],
         "hackernews": {}, "npm": {}, "google_dorks": [],
-        "email_breaches": {}, "reddit_account": {}, "activity_timeline": [],
+        "email_breaches": {}, "reddit_account": {}, "activity_timeline": [], "phone_info": {},
     }
 
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
@@ -793,8 +855,12 @@ async def run(args):
                 prog.remove_task(t)
                 print_activity_timeline(findings["activity_timeline"])
 
+            if args.phone:
+                findings["phone_info"] = analyze_phone_number(args.phone)
+                print_phone_info(findings["phone_info"], args.phone)
+
             t = prog.add_task("Generando Google Dorks...", total=None)
-            findings["google_dorks"] = await generate_google_dorks(args.name, args.username, args.email)
+            findings["google_dorks"] = await generate_google_dorks(args.name, args.username, args.email, args.phone)
             prog.remove_task(t)
             print_dorks(findings["google_dorks"])
 
@@ -840,7 +906,8 @@ FLAGS:
                   genera dorks cruzados adicionales más precisos (nombre.apellido, etc.).
   -e EMAIL      Genera Google Dorks por email + verifica en brechas de datos (HIBP / XposedOrNot)
                   sin necesidad de API key. Muestra brechas conocidas con datos expuestos.
-  -p TELÉFONO   Incluye el teléfono en el contexto del análisis IA.
+  -p TELÉFONO   Valida el número (país, operador, tipo) con phonenumbers, genera Google Dorks
+                  específicos (incluye búsqueda de brechas) y lo suma como contexto al análisis IA.
   --save FILE   Exporta todos los hallazgos en formato JSON o TXT.
   --report NAME Genera un reporte HTML autocontenido (dark theme) con tabla de username lookup,
                   variantes, Google Dorks y análisis IA. Se guarda en reports/NAME.html
@@ -869,7 +936,7 @@ EJEMPLOS:
     parser.add_argument("-n", "--name",     help="Nombre completo")
     parser.add_argument("-u", "--username", help="Username / handle")
     parser.add_argument("-e", "--email",    help="Email")
-    parser.add_argument("-p", "--phone",    help="Teléfono")
+    parser.add_argument("-p", "--phone",    help="Teléfono (validación + dorks + contexto IA)")
     parser.add_argument("--save",           help="Guardar resultados (.json o .txt)", metavar="ARCHIVO")
     parser.add_argument("--report",         help="Generar reporte HTML (guardado en reports/)", metavar="NOMBRE")
     parser.add_argument("--no-ai",          action="store_true", help="Saltar análisis IA")
