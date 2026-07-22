@@ -7,10 +7,13 @@ CLI de reconocimiento OSINT con análisis por IA (Claude, GPT-4, Grok, Gemini).
 import argparse
 import asyncio
 import gc
+import hashlib
+import hmac
 import html
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,7 +22,8 @@ import phonenumbers
 from phonenumbers import NumberParseException, PhoneNumberType, carrier, geocoder
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -108,72 +112,149 @@ class PaidAPIHooks:
         return {"status": "not_implemented", "service": "dehashed"}
 
 
+# ── Integraciones opcionales del wizard (requieren API key propia) ────────────
+# No forman parte de PaidAPIHooks: son llamadas reales, activadas sólo si el
+# usuario provee su propia key durante el wizard interactivo.
+
+async def call_shodan(query: str, api_key: str, client: httpx.AsyncClient) -> dict:
+    try:
+        r = await client.get("https://api.shodan.io/shodan/host/search",
+                              params={"key": api_key, "query": query}, timeout=15.0)
+        if r.status_code == 200:
+            d = r.json()
+            return {"found": True, "total": d.get("total", 0),
+                    "matches": [{"ip": m.get("ip_str"), "port": m.get("port"),
+                                 "org": m.get("org"), "product": m.get("product")}
+                                for m in d.get("matches", [])[:5]]}
+        return {"found": False, "error": f"HTTP {r.status_code}: {r.text[:150]}"}
+    except Exception as e:
+        return {"found": False, "error": str(e)}
+
+
+async def call_hunter_io(email: str, api_key: str, client: httpx.AsyncClient) -> dict:
+    try:
+        r = await client.get("https://api.hunter.io/v2/email-verifier",
+                              params={"email": email, "api_key": api_key}, timeout=15.0)
+        if r.status_code == 200:
+            d = r.json().get("data", {})
+            return {"found": True, "status": d.get("status"), "score": d.get("score"),
+                    "disposable": d.get("disposable"), "webmail": d.get("webmail")}
+        return {"found": False, "error": f"HTTP {r.status_code}: {r.text[:150]}"}
+    except Exception as e:
+        return {"found": False, "error": str(e)}
+
+
+async def call_numverify(phone: str, api_key: str, client: httpx.AsyncClient) -> dict:
+    try:
+        r = await client.get("https://apilayer.net/api/validate",
+                              params={"access_key": api_key, "number": phone}, timeout=15.0)
+        if r.status_code == 200:
+            d = r.json()
+            if d.get("success", True) is False:
+                return {"found": False, "error": d.get("error", {}).get("info", "error desconocido")}
+            return {"found": True, "valid": d.get("valid"), "carrier": d.get("carrier"),
+                    "line_type": d.get("line_type"), "location": d.get("location"),
+                    "country": d.get("country_name")}
+        return {"found": False, "error": f"HTTP {r.status_code}: {r.text[:150]}"}
+    except Exception as e:
+        return {"found": False, "error": str(e)}
+
+
+async def call_hlr_lookups(phone: str, api_key: str, api_secret: str, client: httpx.AsyncClient) -> dict:
+    try:
+        body = json.dumps({"msisdn": phone, "route": None, "storage": None})
+        ts = str(int(time.time()))
+        path = "/api/v2/hlr-lookup"
+        sig_input = f"{path}.{ts}.POST.{body}"
+        signature = hmac.new(api_secret.encode(), sig_input.encode(), hashlib.sha256).hexdigest()
+        r = await client.post(
+            "https://www.hlr-lookups.com" + path,
+            headers={"X-Digest-Key": api_key, "X-Digest-Signature": signature,
+                     "X-Digest-Timestamp": ts, "Content-Type": "application/json"},
+            content=body, timeout=15.0)
+        if r.status_code == 200:
+            d = r.json()
+            return {"found": True, "status": d.get("connectivity_status"),
+                    "carrier": d.get("original_network_name"), "country": d.get("original_country_name"),
+                    "ported": d.get("is_ported")}
+        return {"found": False, "error": f"HTTP {r.status_code}: {r.text[:150]}"}
+    except Exception as e:
+        return {"found": False, "error": str(e)}
+
+
 # ── Búsquedas ─────────────────────────────────────────────────────────────────
 
 _REQUEST_SEMAPHORE = asyncio.Semaphore(5)
 
 
-async def check_username(username: str, client: httpx.AsyncClient) -> list[dict]:
+async def check_username(username: str, client: httpx.AsyncClient, progress: Progress | None = None) -> list[dict]:
     results = []
+    task_id = progress.add_task(f"@{username}", total=len(SHERLOCK_PLATFORMS)) if progress else None
 
     async def check_one(name: str, url_tpl: str):
         url = url_tpl.format(username)
         try:
-            async with _REQUEST_SEMAPHORE:
-                r = await client.get(url, timeout=8.0, follow_redirects=True)
-            found = r.status_code == 200
-            fp_status = "FOUND"
+            try:
+                async with _REQUEST_SEMAPHORE:
+                    r = await client.get(url, timeout=8.0, follow_redirects=True)
+                found = r.status_code == 200
+                fp_status = "FOUND"
 
-            if found:
-                if name == "PyPI":
-                    # PyPI devuelve 200 aunque el usuario no tenga paquetes publicados
-                    if 'href="/project/' not in r.text:
-                        fp_status = "POSIBLE FP"
-                elif name == "HackerNews":
-                    # La página HN devuelve 200 para usuarios inexistentes; verificar con Algolia
-                    try:
-                        hn = await client.get(
-                            f"https://hn.algolia.com/api/v1/search?tags=author_{username}&hitsPerPage=1",
-                            timeout=5.0)
-                        if hn.status_code == 200 and hn.json().get("nbHits", 0) == 0:
+                if found:
+                    if name == "PyPI":
+                        # PyPI devuelve 200 aunque el usuario no tenga paquetes publicados
+                        if 'href="/project/' not in r.text:
                             fp_status = "POSIBLE FP"
-                    except Exception:
-                        pass
-                elif name == "npm":
-                    # npm puede devolver 200 para usuarios sin paquetes publicados
-                    try:
-                        npm_r = await client.get(
-                            f"https://registry.npmjs.org/-/v1/search?text=author:{username}&size=1",
-                            timeout=5.0)
-                        if npm_r.status_code == 200 and npm_r.json().get("total", 0) == 0:
+                    elif name == "HackerNews":
+                        # La página HN devuelve 200 para usuarios inexistentes; verificar con Algolia
+                        try:
+                            hn = await client.get(
+                                f"https://hn.algolia.com/api/v1/search?tags=author_{username}&hitsPerPage=1",
+                                timeout=5.0)
+                            if hn.status_code == 200 and hn.json().get("nbHits", 0) == 0:
+                                fp_status = "POSIBLE FP"
+                        except Exception:
+                            pass
+                    elif name == "npm":
+                        # npm puede devolver 200 para usuarios sin paquetes publicados
+                        try:
+                            npm_r = await client.get(
+                                f"https://registry.npmjs.org/-/v1/search?text=author:{username}&size=1",
+                                timeout=5.0)
+                            if npm_r.status_code == 200 and npm_r.json().get("total", 0) == 0:
+                                fp_status = "POSIBLE FP"
+                        except Exception:
+                            pass
+                    elif name == "Steam":
+                        # Steam devuelve 200 con este texto exacto cuando el perfil no existe
+                        if "The specified profile could not be found" in r.text:
                             fp_status = "POSIBLE FP"
-                    except Exception:
-                        pass
-                elif name == "Steam":
-                    # Steam devuelve 200 con este texto exacto cuando el perfil no existe
-                    if "The specified profile could not be found" in r.text:
-                        fp_status = "POSIBLE FP"
-                elif name == "Twitch":
-                    # Canales inexistentes devuelven <title>Twitch</title> genérico (sin nombre
-                    # de canal); no usar el meta og:title porque Twitch lo emite con comillas
-                    # simples (<meta property='og:title' content='Twitch'>).
-                    if "<title>Twitch</title>" in r.text:
-                        fp_status = "POSIBLE FP"
+                    elif name == "Twitch":
+                        # Canales inexistentes devuelven <title>Twitch</title> genérico (sin nombre
+                        # de canal); no usar el meta og:title porque Twitch lo emite con comillas
+                        # simples (<meta property='og:title' content='Twitch'>).
+                        if "<title>Twitch</title>" in r.text:
+                            fp_status = "POSIBLE FP"
 
-            confidence = PLATFORM_CONFIDENCE.get(name, "Medio") if found else None
-            results.append({
-                "platform": name, "url": url,
-                "found": found, "status_code": r.status_code,
-                "confidence": confidence, "fp_status": fp_status,
-            })
-        except Exception:
-            results.append({
-                "platform": name, "url": url,
-                "found": False, "status_code": None,
-                "confidence": None, "fp_status": "NOT FOUND",
-            })
+                confidence = PLATFORM_CONFIDENCE.get(name, "Medio") if found else None
+                results.append({
+                    "platform": name, "url": url,
+                    "found": found, "status_code": r.status_code,
+                    "confidence": confidence, "fp_status": fp_status,
+                })
+            except Exception:
+                results.append({
+                    "platform": name, "url": url,
+                    "found": False, "status_code": None,
+                    "confidence": None, "fp_status": "NOT FOUND",
+                })
+        finally:
+            if progress:
+                progress.update(task_id, advance=1, description=f"@{username}: {name}")
 
     await asyncio.gather(*[check_one(n, u) for n, u in SHERLOCK_PLATFORMS])
+    if progress:
+        progress.remove_task(task_id)
     gc.collect()
     return sorted(results, key=lambda x: x["found"], reverse=True)
 
@@ -182,9 +263,10 @@ def generate_username_variants(username: str) -> list[str]:
     return [f"{username}_", f"_{username}", f"{username}01", f"{username}1337"]
 
 
-async def check_username_variants(username: str, client: httpx.AsyncClient) -> dict[str, list[dict]]:
+async def check_username_variants(username: str, client: httpx.AsyncClient,
+                                   progress: Progress | None = None) -> dict[str, list[dict]]:
     variants = generate_username_variants(username)
-    results = await asyncio.gather(*[check_username(v, client) for v in variants])
+    results = await asyncio.gather(*[check_username(v, client, progress=progress) for v in variants])
     gc.collect()
     return dict(zip(variants, results))
 
@@ -576,7 +658,7 @@ def print_email_breaches(result: dict, email: str):
                 date_b = b.get("date", "?") if isinstance(b, dict) else "?"
                 data_b = b.get("data", []) if isinstance(b, dict) else []
                 data_str = ", ".join(data_b[:3]) if isinstance(data_b, list) else str(data_b)
-                tbl.add_row(name_b, date_b, data_str or "—")
+                tbl.add_row(str(name_b), str(date_b), str(data_str or "—"))
             console.print(tbl)
     else:
         source = result.get("source", "desconocida")
@@ -784,19 +866,57 @@ def generate_html_report(findings: dict, analysis: str) -> str:
 """
 
 
+def _resolve_reports_path(filename: str, suffix: str) -> Path:
+    reports_dir = Path(__file__).resolve().parent / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    name = Path(filename).name
+    if not name.lower().endswith(suffix):
+        name += suffix
+    return reports_dir / name
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def run(args):
-    console.print(BANNER)
+async def _prompt_paid_api(service: str, url: str, rationale: str, findings: dict,
+                            client: httpx.AsyncClient, single_key: bool, caller) -> None:
+    console.print(Panel(
+        f"{rationale}\n[blue]{url}[/blue]",
+        title=f"[bold yellow]💡 Opcional: {service}[/bold yellow]", border_style="yellow"))
+    if not Confirm.ask(f"¿Tenés una API key de {service}?", default=False):
+        return
+    api_key = Prompt.ask("API key", password=True)
+    if single_key:
+        result = await caller(api_key, client)
+    else:
+        api_secret = Prompt.ask("API secret", password=True)
+        result = await caller(api_key, api_secret, client)
+    findings["paid_api_results"][service] = result
+    if result.get("found"):
+        t = Text()
+        for k, v in result.items():
+            if k == "found" or v is None:
+                continue
+            t.append(f"  {k}: ", style="bold yellow")
+            t.append(f"{v}\n", style="white")
+        console.print(Panel(t, title=f"[bold green]✓ {service}[/bold green]", border_style="green"))
+    else:
+        console.print(f"[red]✗ {service}:[/red] [dim]{result.get('error', 'sin resultado')}[/dim]")
 
-    # Config interactiva al arrancar
-    cfg = setup_interactive()
+
+async def run(args):
+    if args.wizard_mode:
+        # El wizard ya mostró el banner y resolvió la config antes de armar el form.
+        cfg = args.wizard_cfg
+    else:
+        console.print(BANNER)
+        cfg = setup_interactive()
     provider = cfg["provider"]
     api_key  = cfg["api_key"]
 
     console.print(f"\n[dim]Usando: [bold]{provider['name']}[/bold] — {provider['model']}[/dim]\n")
 
-    if not any([args.name, args.username, args.email, args.phone]):
+    if not any([args.name, args.username, args.email, args.phone,
+                args.extra_platforms, args.github_handle]):
         console.print("[red]Error:[/red] Necesitás al menos un input. Usá --help.")
         sys.exit(1)
 
@@ -806,6 +926,7 @@ async def run(args):
         "username_lookup": [], "username_variants": {}, "github": {}, "github_repos": [],
         "hackernews": {}, "npm": {}, "google_dorks": [],
         "email_breaches": {}, "reddit_account": {}, "activity_timeline": [], "phone_info": {},
+        "extra_platforms": {}, "paid_api_results": {},
     }
 
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
@@ -819,21 +940,37 @@ async def run(args):
                       console=console) as prog:
 
             if args.username:
-                t = prog.add_task(f"Buscando @{args.username} en plataformas...", total=None)
-                findings["username_lookup"] = await check_username(args.username, client)
-                prog.remove_task(t)
+                if args.wizard_mode:
+                    with Progress(TextColumn("[bold red]{task.description}"),
+                                  BarColumn(bar_width=40, complete_style="red", finished_style="green"),
+                                  TextColumn("[cyan]{task.completed}/{task.total}[/cyan]"),
+                                  console=console) as bar_prog:
+                        findings["username_lookup"] = await check_username(args.username, client, progress=bar_prog)
+                else:
+                    t = prog.add_task(f"Buscando @{args.username} en plataformas...", total=None)
+                    findings["username_lookup"] = await check_username(args.username, client)
+                    prog.remove_task(t)
                 print_username_results(findings["username_lookup"])
 
                 if any(r["found"] and r.get("fp_status") != "POSIBLE FP"
                        for r in findings["username_lookup"]):
-                    t = prog.add_task(f"Correlacionando variantes de @{args.username}...", total=None)
-                    findings["username_variants"] = await check_username_variants(args.username, client)
-                    prog.remove_task(t)
+                    if args.wizard_mode:
+                        with Progress(TextColumn("[bold red]{task.description}"),
+                                      BarColumn(bar_width=40, complete_style="red", finished_style="green"),
+                                      TextColumn("[cyan]{task.completed}/{task.total}[/cyan]"),
+                                      console=console) as bar_prog:
+                            findings["username_variants"] = await check_username_variants(
+                                args.username, client, progress=bar_prog)
+                    else:
+                        t = prog.add_task(f"Correlacionando variantes de @{args.username}...", total=None)
+                        findings["username_variants"] = await check_username_variants(args.username, client)
+                        prog.remove_task(t)
                     print_username_variants(args.username, findings["username_variants"])
 
+                gh_handle = args.github_handle or args.username
                 t = prog.add_task("Analizando GitHub...", total=None)
-                findings["github"]       = await check_github_profile(args.username, client)
-                findings["github_repos"] = await check_github_repos(args.username, client)
+                findings["github"]       = await check_github_profile(gh_handle, client)
+                findings["github_repos"] = await check_github_repos(gh_handle, client)
                 prog.remove_task(t)
                 print_github_info(findings["github"], findings["github_repos"])
 
@@ -855,9 +992,45 @@ async def run(args):
                 prog.remove_task(t)
                 print_activity_timeline(findings["activity_timeline"])
 
+            elif args.github_handle:
+                t = prog.add_task("Analizando GitHub...", total=None)
+                findings["github"]       = await check_github_profile(args.github_handle, client)
+                findings["github_repos"] = await check_github_repos(args.github_handle, client)
+                prog.remove_task(t)
+                print_github_info(findings["github"], findings["github_repos"])
+
+            if args.extra_platforms:
+                for platform_name, handle in args.extra_platforms.items():
+                    t = prog.add_task(f"Buscando {platform_name}: @{handle}...", total=None)
+                    platform_results = await check_username(handle, client)
+                    prog.remove_task(t)
+                    row = next((r for r in platform_results if r["platform"] == platform_name), None)
+                    if row:
+                        findings["extra_platforms"][platform_name] = row
+                        print_username_results([row])
+
+            if args.wizard_mode and args.username:
+                await _prompt_paid_api(
+                    "Shodan", "https://www.shodan.io/",
+                    "Búsqueda de infraestructura/dispositivos asociados a este username.",
+                    findings, client, single_key=True,
+                    caller=lambda key, c: call_shodan(args.username, key, c))
+
             if args.phone:
                 findings["phone_info"] = analyze_phone_number(args.phone)
                 print_phone_info(findings["phone_info"], args.phone)
+
+                if args.wizard_mode:
+                    await _prompt_paid_api(
+                        "NumVerify", "https://numverify.com/",
+                        "Validación de teléfono con datos de operador y línea más precisos.",
+                        findings, client, single_key=True,
+                        caller=lambda key, c: call_numverify(args.phone, key, c))
+                    await _prompt_paid_api(
+                        "HLR Lookups", "https://www.hlr-lookups.com/",
+                        "Estado de conectividad en tiempo real (HLR) del número.",
+                        findings, client, single_key=False,
+                        caller=lambda key, secret, c: call_hlr_lookups(args.phone, key, secret, c))
 
             t = prog.add_task("Generando Google Dorks...", total=None)
             findings["google_dorks"] = await generate_google_dorks(args.name, args.username, args.email, args.phone)
@@ -870,6 +1043,13 @@ async def run(args):
                 prog.remove_task(t)
                 print_email_breaches(findings["email_breaches"], args.email)
 
+                if args.wizard_mode:
+                    await _prompt_paid_api(
+                        "Hunter.io", "https://hunter.io/",
+                        "Verificación de deliverability y metadata adicional del email.",
+                        findings, client, single_key=True,
+                        caller=lambda key, c: call_hunter_io(args.email, key, c))
+
             if not args.no_ai:
                 t = prog.add_task(f"Analizando con {provider['name']}...", total=None)
                 analysis = await analyze_with_ai(findings, provider, api_key, client)
@@ -879,21 +1059,118 @@ async def run(args):
             else:
                 analysis = ""
 
+        if args.wizard_mode:
+            console.print()
+            choice = Prompt.ask(
+                "¿Querés guardar los resultados?\n"
+                "  1. Reporte completo HTML\n"
+                "  2. Solo análisis IA en TXT\n"
+                "  3. Ambos (HTML + TXT)\n"
+                "  4. No guardar",
+                choices=["1", "2", "3", "4"], default="4")
+            if choice != "4":
+                save_filename = Prompt.ask("Nombre del archivo (sin extensión)")
+                if choice in ("1", "3"):
+                    html_path = _resolve_reports_path(save_filename, ".html")
+                    html_path.write_text(generate_html_report(findings, analysis), encoding="utf-8")
+                    console.print(f"[green]✓ Reporte HTML guardado en:[/green] [bold]{html_path.resolve()}[/bold]")
+                if choice in ("2", "3"):
+                    txt_path = _resolve_reports_path(save_filename, ".txt")
+                    txt_path.write_text(analysis, encoding="utf-8")
+                    console.print(f"[green]✓ Análisis TXT guardado en:[/green] [bold]{txt_path.resolve()}[/bold]")
+
         if args.save:
             save_results(findings, analysis, args.save)
 
         if args.report:
-            reports_dir = Path(__file__).resolve().parent / "reports"
-            reports_dir.mkdir(exist_ok=True)
-            filename = Path(args.report).name
-            if not filename.lower().endswith(".html"):
-                filename += ".html"
-            report_path = reports_dir / filename
+            report_path = _resolve_reports_path(args.report, ".html")
             report_path.write_text(generate_html_report(findings, analysis), encoding="utf-8")
             console.print(f"\n[green]✓ Reporte HTML guardado en:[/green] [bold]{report_path.resolve()}[/bold]")
 
 
+_WIZARD_FIELDS = [
+    ("nombre", "Nombre"), ("apellido", "Apellido"), ("username", "Username / Handle"),
+    ("email", "Email"), ("phone", "Teléfono"), ("instagram", "Instagram"),
+    ("github", "GitHub"), ("twitter", "Twitter/X"), ("tiktok", "TikTok"),
+    ("linkedin", "LinkedIn"), ("steam", "Steam"), ("twitch", "Twitch"),
+]
+
+_WIZARD_PLATFORM_MAP = {
+    "instagram": "Instagram", "twitter": "Twitter/X", "tiktok": "TikTok",
+    "linkedin": "LinkedIn", "steam": "Steam", "twitch": "Twitch",
+}
+
+
+def _print_wizard_summary(answers: dict, name: str | None, extra_platforms: dict) -> None:
+    rows = [
+        (bool(name), "Nombre", "Google Dorks", "no ingresado (se saltea generación de dorks por nombre)"),
+        (bool(answers["username"]), "Username",
+         "lookup en 20+ plataformas + variantes + GitHub/HackerNews/npm/Reddit",
+         "no ingresado (se saltea lookup de plataformas)"),
+        (bool(answers["email"]), "Email", "Google Dorks + verificación de brechas",
+         "no ingresado (se saltea breach check)"),
+        (bool(answers["phone"]), "Teléfono", "validación + dorks", "no ingresado (se saltea validación)"),
+        (bool(answers["github"]), "GitHub", f"perfil enriquecido (@{answers['github']})",
+         "no ingresado (se usa Username si está disponible)"),
+        (bool(extra_platforms), "Plataformas adicionales",
+         ", ".join(extra_platforms) if extra_platforms else "", "ninguna ingresada"),
+    ]
+    t = Text()
+    for ok, label, do_desc, skip_desc in rows:
+        if ok:
+            t.append("✓ ", style="bold green")
+            t.append(f"{label}", style="green")
+            t.append(f" — {do_desc}\n", style="green")
+        else:
+            t.append(f"✗ {label} — {skip_desc}\n", style="dim")
+    console.print(Panel(t, title="[bold red]📋 Resumen de búsqueda[/bold red]", border_style="red"))
+
+
+async def run_wizard():
+    console.print(BANNER)
+
+    cfg = setup_interactive()
+
+    console.print(Panel(
+        "Completá los campos que tengas — presioná Enter para omitir cualquiera.",
+        title="[bold red]🧙 Modo Wizard — OSINT Person Finder[/bold red]", border_style="red"))
+
+    answers = {}
+    for key, label in _WIZARD_FIELDS:
+        answers[key] = Prompt.ask(f"[cyan]{label}[/cyan]", default="").strip()
+
+    name = f"{answers['nombre']} {answers['apellido']}".strip() or None
+    extra_platforms = {_WIZARD_PLATFORM_MAP[k]: answers[k] for k in _WIZARD_PLATFORM_MAP if answers[k]}
+
+    ns = argparse.Namespace(
+        name=name,
+        username=answers["username"] or None,
+        email=answers["email"] or None,
+        phone=answers["phone"] or None,
+        save=None, report=None, no_ai=False,
+        wizard_mode=True,
+        wizard_cfg=cfg,
+        extra_platforms=extra_platforms,
+        github_handle=answers["github"] or None,
+    )
+
+    if not any([ns.name, ns.username, ns.email, ns.phone, ns.extra_platforms, ns.github_handle]):
+        console.print("[red]Error:[/red] No completaste ningún campo.")
+        return
+
+    _print_wizard_summary(answers, name, extra_platforms)
+
+    await run(ns)
+
+
 def main():
+    if len(sys.argv) == 1:
+        try:
+            asyncio.run(run_wizard())
+        except KeyboardInterrupt:
+            console.print("\n[yellow]⚠ Interrumpido.[/yellow]")
+        return
+
     parser = argparse.ArgumentParser(
         description="[BlackSec] OSINT Person Finder AI — Reconocimiento multi-vector con análisis IA",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -915,6 +1192,9 @@ FLAGS:
   --no-ai       Saltear análisis IA (útil para reconocimiento rápido sin API key).
 
 EJEMPLOS:
+  # Modo wizard interactivo (sin argumentos) — formulario guiado paso a paso
+  python osint_finder.py
+
   # Username lookup completo con scoring de confianza (recomendado como primer paso)
   python osint_finder.py -u johndoe
 
@@ -940,6 +1220,7 @@ EJEMPLOS:
     parser.add_argument("--save",           help="Guardar resultados (.json o .txt)", metavar="ARCHIVO")
     parser.add_argument("--report",         help="Generar reporte HTML (guardado en reports/)", metavar="NOMBRE")
     parser.add_argument("--no-ai",          action="store_true", help="Saltar análisis IA")
+    parser.set_defaults(wizard_mode=False, wizard_cfg=None, extra_platforms={}, github_handle=None)
     args = parser.parse_args()
 
     try:
